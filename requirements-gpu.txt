@@ -1,0 +1,8 @@
+# ─────────────────────────────────────────────────────────────
+# Video Watermark Remover Pro - Optional GPU AI Acceleration
+# Install this file for AI Neural Inpainting (LaMa GPU Batching)
+# ─────────────────────────────────────────────────────────────
+-r requirements.txt
+torch>=2.0.0
+torchvision>=0.15.0
+simple-lama-inpainting>=0.1.0

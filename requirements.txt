@@ -1,0 +1,9 @@
+# Production Dependencies for Watermark Studio
+customtkinter>=5.2.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+torch>=2.0.0
+torchvision>=0.15.0
+simple-lama-inpainting>=0.1.2
+imageio-ffmpeg>=0.5.1
