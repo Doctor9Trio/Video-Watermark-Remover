@@ -68,33 +68,69 @@ class MediaCanvasViewport(ctk.CTkFrame):
         self.photo = None
         self.image_id = None
         self.rect_ids = []
+        self.brush_overlay_id = None
+        self.cursor_ring_id = None
+
+        # Tool Mode: "box", "brush", "eraser"
+        self.tool_mode = "box"
+        self.brush_size = 30
+        self.brush_last_pos = None
+
+        # Interactive Box State
+        self.selected_box_idx = 0
+        self.active_handle = None  # None, "body", "nw", "ne", "se", "sw", "n", "s", "e", "w"
         self.drag_start = None
+        self.drag_orig_box = None
         self.current_drag_id = None
 
         # Split Wiper State
         self.split_wiper_active = False
         self.split_pos = 0.5
         self.clean_preview_frame = None
-        self.wiper_line_id = None
-        self.wiper_label_left = None
-        self.wiper_label_right = None
 
         self.canvas = tk.Canvas(self, bg="#151515", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
+        # Mouse & Keyboard Event Bindings
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", self._on_leave)
         self.canvas.bind("<Configure>", self._on_resize)
+        
+        # Keyboard delete bindings
+        self.canvas.bind("<Delete>", lambda e: self.delete_selected_box())
+        self.canvas.bind("<BackSpace>", lambda e: self.delete_selected_box())
+        self.canvas.focus_set()
 
         self._resize_timer = None
         self.render_placeholder()
+
+    def set_tool_mode(self, mode):
+        self.tool_mode = mode
+        if self.cursor_ring_id:
+            self.canvas.delete(self.cursor_ring_id)
+            self.cursor_ring_id = None
+        self.canvas.config(cursor="crosshair" if mode == "box" else "none")
+        if mode in ["brush", "eraser"]:
+            for rid in self.rect_ids:
+                self.canvas.delete(rid)
+            self.rect_ids = []
+            if self.current_drag_id:
+                self.canvas.delete(self.current_drag_id)
+                self.current_drag_id = None
+        else:
+            self.redraw_all_regions()
+
+    def set_brush_size(self, size):
+        self.brush_size = max(5, int(size))
 
     def render_placeholder(self):
         self.canvas.delete("all")
         self.image_id = None
         self.rect_ids = []
+        self.brush_overlay_id = None
         self.current_drag_id = None
         cw = max(100, self.canvas.winfo_width())
         ch = max(100, self.canvas.winfo_height())
@@ -138,6 +174,10 @@ class MediaCanvasViewport(ctk.CTkFrame):
         self.offset_x = (cw - disp_w) // 2
         self.offset_y = (ch - disp_h) // 2
 
+        # Initialize brush mask if needed
+        if getattr(self.app, "brush_mask", None) is None or self.app.brush_mask.shape[:2] != (h, w):
+            self.app.brush_mask = np.zeros((h, w), dtype=np.uint8)
+
         if self.split_wiper_active and self.clean_preview_frame is not None:
             split_pixel = int(w * self.split_pos)
             composite = frame.copy()
@@ -146,6 +186,18 @@ class MediaCanvasViewport(ctk.CTkFrame):
             rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
         else:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Composite brush mask overlay if active
+        if np.any(self.app.brush_mask > 0) and not self.split_wiper_active:
+            rgb = rgb.copy()
+            b_mask = (self.app.brush_mask > 0)
+            # Coral red overlay (RGB: 255, 68, 68) with 45% blend
+            overlay = rgb.copy()
+            overlay[b_mask] = (overlay[b_mask].astype(np.float32) * 0.55 + np.array([255, 68, 68]) * 0.45).astype(np.uint8)
+            # Draw contour border on brush mask
+            contours, _ = cv2.findContours(self.app.brush_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, contours, -1, (255, 255, 255), 2)
+            rgb = overlay
 
         pil_img = Image.fromarray(rgb).resize((disp_w, disp_h), Image.Resampling.BILINEAR)
         self.photo = ImageTk.PhotoImage(pil_img)
@@ -175,12 +227,15 @@ class MediaCanvasViewport(ctk.CTkFrame):
                 self.split_wiper_active = False
                 return
             all_r = self.app.get_all_regions()
-            if not all_r:
-                messagebox.showwarning("No Region", "Select at least one watermark region to preview.")
+            has_brush = np.any(getattr(self.app, "brush_mask", 0) > 0)
+            if not all_r and not has_brush:
+                messagebox.showwarning("No Region", "Select at least one watermark region or brush area to preview.")
                 self.split_wiper_active = False
                 return
             self.app._apply_settings()
             clean = self.app.current_frame.copy()
+            if has_brush:
+                clean = vlr.process_image_array(clean, custom_mask=self.app.brush_mask)
             for (x, y, w, h) in all_r:
                 fh, fw = clean.shape[:2]
                 pad = int(40 * (max(fh, fw) / 1080.0))
@@ -222,17 +277,42 @@ class MediaCanvasViewport(ctk.CTkFrame):
             self.canvas.delete(rid)
         self.rect_ids = []
 
+        # If currently in Brush Mode, NEVER draw any rectangle boxes or handles
+        if self.tool_mode in ["brush", "eraser"]:
+            return
+
         all_r = self.app.get_all_regions()
         colors = [ACCENT_PRIMARY, "#17824B", "#2A70E8", "#D97706", "#9333EA"]
+        
         for idx, (x, y, w, h) in enumerate(all_r):
             cx1 = self.offset_x + int(x * self.scale)
             cy1 = self.offset_y + int(y * self.scale)
             cx2 = self.offset_x + int((x + w) * self.scale)
             cy2 = self.offset_y + int((y + h) * self.scale)
             col = colors[idx % len(colors)]
-            rect_id = self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=col, width=2, dash=(6, 4))
-            txt_id = self.canvas.create_text(cx1 + 12, cy1 - 8, text=f"R{idx+1}", font=("Segoe UI", 8, "bold"), fill=col)
-            self.rect_ids.extend([rect_id, txt_id])
+            is_sel = (idx == self.selected_box_idx)
+
+            if is_sel:
+                # Highlight active selected box with glowing border and 8 handles
+                rect_id = self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="#FFFFFF", width=3)
+                rect_id2 = self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=col, width=2)
+                txt_id = self.canvas.create_text(cx1 + 24, cy1 - 10, text=f"R{idx+1} [SELECTED]", font=("Segoe UI", 9, "bold"), fill=col)
+                self.rect_ids.extend([rect_id, rect_id2, txt_id])
+
+                # Draw 8 resize handles (4 corners + 4 edge midpoints)
+                hs = 5
+                handles = [
+                    (cx1, cy1), ((cx1+cx2)//2, cy1), (cx2, cy1),
+                    (cx1, (cy1+cy2)//2), (cx2, (cy1+cy2)//2),
+                    (cx1, cy2), ((cx1+cx2)//2, cy2), (cx2, cy2)
+                ]
+                for (hx, hy) in handles:
+                    h_id = self.canvas.create_rectangle(hx - hs, hy - hs, hx + hs, hy + hs, fill="#FFFFFF", outline="#111111", width=1)
+                    self.rect_ids.append(h_id)
+            else:
+                rect_id = self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=col, width=2, dash=(6, 4))
+                txt_id = self.canvas.create_text(cx1 + 12, cy1 - 8, text=f"R{idx+1}", font=("Segoe UI", 8, "bold"), fill=col)
+                self.rect_ids.extend([rect_id, txt_id])
 
     def draw_region(self, region):
         self.redraw_all_regions()
@@ -244,17 +324,79 @@ class MediaCanvasViewport(ctk.CTkFrame):
         if self.current_drag_id:
             self.canvas.delete(self.current_drag_id)
             self.current_drag_id = None
+        if hasattr(self.app, "brush_mask") and self.app.brush_mask is not None:
+            self.app.brush_mask.fill(0)
+        if self.app.current_frame is not None:
+            self.show_frame(self.app.current_frame)
+
+    def delete_selected_box(self):
+        """Delete currently selected box."""
+        if hasattr(self.app, "regions") and self.app.regions:
+            if 0 <= self.selected_box_idx < len(self.app.regions):
+                self.app.regions.pop(self.selected_box_idx)
+                if self.app.regions:
+                    self.selected_box_idx = max(0, min(self.selected_box_idx, len(self.app.regions) - 1))
+                    self.app.region = self.app.regions[self.selected_box_idx]
+                else:
+                    self.app.region = None
+                    self.selected_box_idx = 0
+                self.redraw_all_regions()
+                self.app.sidebar.update_region_display()
 
     def _canvas_to_real(self, cx, cy):
         rx = (cx - self.offset_x) / max(self.scale, 1e-6)
         ry = (cy - self.offset_y) / max(self.scale, 1e-6)
         return rx, ry
 
+    def _real_to_canvas(self, rx, ry):
+        cx = self.offset_x + int(rx * self.scale)
+        cy = self.offset_y + int(ry * self.scale)
+        return cx, cy
+
+    def _hit_test(self, cx, cy):
+        """Hit test for resize handles, box body, or canvas background."""
+        all_r = self.app.get_all_regions()
+        if not all_r:
+            return None, None
+
+        # Check handles of the active selected box first
+        if 0 <= self.selected_box_idx < len(all_r):
+            x, y, w, h = all_r[self.selected_box_idx]
+            cx1, cy1 = self._real_to_canvas(x, y)
+            cx2, cy2 = self._real_to_canvas(x + w, y + h)
+            hs = 8
+            
+            # Corner and edge handle bounds
+            handle_map = {
+                "nw": (cx1 - hs, cy1 - hs, cx1 + hs, cy1 + hs),
+                "ne": (cx2 - hs, cy1 - hs, cx2 + hs, cy1 + hs),
+                "se": (cx2 - hs, cy2 - hs, cx2 + hs, cy2 + hs),
+                "sw": (cx1 - hs, cy2 - hs, cx1 + hs, cy2 + hs),
+                "n": ((cx1+cx2)//2 - hs, cy1 - hs, (cx1+cx2)//2 + hs, cy1 + hs),
+                "s": ((cx1+cx2)//2 - hs, cy2 - hs, (cx1+cx2)//2 + hs, cy2 + hs),
+                "w": (cx1 - hs, (cy1+cy2)//2 - hs, cx1 + hs, (cy1+cy2)//2 + hs),
+                "e": (cx2 - hs, (cy1+cy2)//2 - hs, cx2 + hs, (cy1+cy2)//2 + hs),
+            }
+            for h_name, (hx1, hy1, hx2, hy2) in handle_map.items():
+                if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
+                    return h_name, self.selected_box_idx
+
+        # Check body of all boxes (reverse order for top-most)
+        for idx in reversed(range(len(all_r))):
+            x, y, w, h = all_r[idx]
+            cx1, cy1 = self._real_to_canvas(x, y)
+            cx2, cy2 = self._real_to_canvas(x + w, y + h)
+            if cx1 <= cx <= cx2 and cy1 <= cy <= cy2:
+                return "body", idx
+
+        return None, None
+
     def _on_press(self, event):
+        self.canvas.focus_set()
         if self.app.current_frame is None or self.app.processing:
             return
+
         if self.split_wiper_active:
-            cw = self.canvas.winfo_width()
             h, w = self.app.current_frame.shape[:2]
             disp_w = max(1, int(w * self.scale))
             rel_x = (event.x - self.offset_x) / max(disp_w, 1)
@@ -262,65 +404,188 @@ class MediaCanvasViewport(ctk.CTkFrame):
             self.show_frame(self.app.current_frame)
             return
 
-        self.drag_start = (event.x, event.y)
-        if self.current_drag_id:
-            self.canvas.delete(self.current_drag_id)
+        # ─── Freeform Brush Mode ────────────────────────
+        if self.tool_mode in ["brush", "eraser"]:
+            rx, ry = self._canvas_to_real(event.x, event.y)
+            h, w = self.app.current_frame.shape[:2]
+            if 0 <= rx < w and 0 <= ry < h:
+                self.brush_last_pos = (int(rx), int(ry))
+                val = 255 if self.tool_mode == "brush" else 0
+                cv2.circle(self.app.brush_mask, (int(rx), int(ry)), int(self.brush_size / 2), val, -1)
+                self.show_frame(self.app.current_frame)
+            return
+
+        # ─── Multi-Box Interactive Mode ─────────────────
+        hit_handle, hit_idx = self._hit_test(event.x, event.y)
+        if hit_idx is not None:
+            self.selected_box_idx = hit_idx
+            self.app.region = self.app.regions[hit_idx]
+            self.active_handle = hit_handle
+            self.drag_start = (event.x, event.y)
+            self.drag_orig_box = tuple(self.app.regions[hit_idx])
+            self.redraw_all_regions()
+            self.app.sidebar.update_region_display()
+        else:
+            # Clicked outside: start drawing a new rectangle box
+            self.active_handle = "new"
+            self.drag_start = (event.x, event.y)
+            if self.current_drag_id:
+                self.canvas.delete(self.current_drag_id)
+                self.current_drag_id = None
 
     def _on_motion(self, event):
-        if self.split_wiper_active and self.app.current_frame is not None:
-            if event.state & 0x0100:  # Button 1 pressed
-                h, w = self.app.current_frame.shape[:2]
-                disp_w = max(1, int(w * self.scale))
-                rel_x = (event.x - self.offset_x) / max(disp_w, 1)
-                self.split_pos = max(0.02, min(0.98, rel_x))
-                self.show_frame(self.app.current_frame)
+        if self.app.current_frame is None:
+            return
+
+        # Update Brush cursor ring indicator
+        if self.tool_mode in ["brush", "eraser"]:
+            cr = int(self.brush_size * self.scale / 2)
+            if self.cursor_ring_id:
+                self.canvas.coords(self.cursor_ring_id, event.x - cr, event.y - cr, event.x + cr, event.y + cr)
+            else:
+                self.cursor_ring_id = self.canvas.create_oval(
+                    event.x - cr, event.y - cr, event.x + cr, event.y + cr,
+                    outline="#FF4444" if self.tool_mode == "brush" else "#FFFFFF",
+                    width=2
+                )
+            return
+
+        # Split Wiper Drag
+        if self.split_wiper_active and (event.state & 0x0100):
+            h, w = self.app.current_frame.shape[:2]
+            disp_w = max(1, int(w * self.scale))
+            rel_x = (event.x - self.offset_x) / max(disp_w, 1)
+            self.split_pos = max(0.02, min(0.98, rel_x))
+            self.show_frame(self.app.current_frame)
+            return
+
+        # Update dynamic hover cursor for box handles
+        handle, _ = self._hit_test(event.x, event.y)
+        cursor_map = {
+            "nw": "size_nw_se", "se": "size_nw_se",
+            "ne": "size_ne_sw", "sw": "size_ne_sw",
+            "n": "size_ns", "s": "size_ns",
+            "w": "size_we", "e": "size_we",
+            "body": "fleur"
+        }
+        self.canvas.config(cursor=cursor_map.get(handle, "crosshair"))
+
+    def _on_leave(self, event):
+        if self.cursor_ring_id:
+            self.canvas.delete(self.cursor_ring_id)
+            self.cursor_ring_id = None
 
     def _on_drag(self, event):
-        if self.split_wiper_active:
+        if self.app.current_frame is None or self.app.processing:
+            return
+
+        # Freeform Brush Paint
+        if self.tool_mode in ["brush", "eraser"]:
+            rx, ry = self._canvas_to_real(event.x, event.y)
+            h, w = self.app.current_frame.shape[:2]
+            curr_pos = (int(np.clip(rx, 0, w - 1)), int(np.clip(ry, 0, h - 1)))
+            val = 255 if self.tool_mode == "brush" else 0
+            if self.brush_last_pos is not None:
+                cv2.line(self.app.brush_mask, self.brush_last_pos, curr_pos, val, self.brush_size)
+            cv2.circle(self.app.brush_mask, curr_pos, int(self.brush_size / 2), val, -1)
+            self.brush_last_pos = curr_pos
+            self.show_frame(self.app.current_frame)
             self._on_motion(event)
             return
-        if not self.drag_start:
-            return
-        if self.current_drag_id:
-            self.canvas.delete(self.current_drag_id)
-        sx, sy = self.drag_start
-        self.current_drag_id = self.canvas.create_rectangle(
-            sx, sy, event.x, event.y,
-            outline=ACCENT_PRIMARY, width=2, dash=(6, 4)
-        )
 
-    def _on_release(self, event):
-        if self.split_wiper_active:
+        if not self.drag_start or self.drag_orig_box is None and self.active_handle != "new":
             return
-        if not self.drag_start or self.app.current_frame is None:
-            return
-        sx, sy = self.drag_start
-        ex, ey = event.x, event.y
-        self.drag_start = None
-        if self.current_drag_id:
-            self.canvas.delete(self.current_drag_id)
-            self.current_drag_id = None
-
-        rx1, ry1 = self._canvas_to_real(min(sx, ex), min(sy, ey))
-        rx2, ry2 = self._canvas_to_real(max(sx, ex), max(sy, ey))
 
         h, w = self.app.current_frame.shape[:2]
-        x = max(0, int(rx1))
-        y = max(0, int(ry1))
-        rw = min(w - x, int(rx2 - rx1))
-        rh = min(h - y, int(ry2 - ry1))
+        sx, sy = self.drag_start
+        dx = (event.x - sx) / max(self.scale, 1e-6)
+        dy = (event.y - sy) / max(self.scale, 1e-6)
 
-        if rw < 5 or rh < 5:
+        # Move Entire Box
+        if self.active_handle == "body":
+            ox, oy, ow, oh = self.drag_orig_box
+            nx = int(np.clip(ox + dx, 0, w - ow))
+            ny = int(np.clip(oy + dy, 0, h - oh))
+            self.app.regions[self.selected_box_idx] = (nx, ny, ow, oh)
+            self.app.region = (nx, ny, ow, oh)
+            self.redraw_all_regions()
+            self.app.sidebar.update_region_display()
+
+        # Resize Handles
+        elif self.active_handle in ["nw", "ne", "se", "sw", "n", "s", "e", "w"]:
+            ox, oy, ow, oh = self.drag_orig_box
+            nx, ny, nw, nh = ox, oy, ow, oh
+
+            if "e" in self.active_handle:
+                nw = max(10, int(ow + dx))
+                nw = min(w - ox, nw)
+            if "s" in self.active_handle:
+                nh = max(10, int(oh + dy))
+                nh = min(h - oy, nh)
+            if "w" in self.active_handle:
+                diff_x = int(dx)
+                if ow - diff_x >= 10:
+                    nx = int(np.clip(ox + diff_x, 0, ox + ow - 10))
+                    nw = ow - (nx - ox)
+            if "n" in self.active_handle:
+                diff_y = int(dy)
+                if oh - diff_y >= 10:
+                    ny = int(np.clip(oy + diff_y, 0, oy + oh - 10))
+                    nh = oh - (ny - oy)
+
+            self.app.regions[self.selected_box_idx] = (nx, ny, nw, nh)
+            self.app.region = (nx, ny, nw, nh)
+            self.redraw_all_regions()
+            self.app.sidebar.update_region_display()
+
+        # Drawing New Box
+        elif self.active_handle == "new":
+            if self.current_drag_id:
+                self.canvas.delete(self.current_drag_id)
+            self.current_drag_id = self.canvas.create_rectangle(
+                sx, sy, event.x, event.y,
+                outline=ACCENT_PRIMARY, width=2, dash=(6, 4)
+            )
+
+    def _on_release(self, event):
+        if self.tool_mode in ["brush", "eraser"]:
+            self.brush_last_pos = None
+            self.app.sidebar.update_region_display()
             return
 
-        self.app.region = (x, y, rw, rh)
-        if not self.app.regions:
-            self.app.regions = [self.app.region]
-        else:
-            self.app.regions[0] = self.app.region
+        if self.active_handle == "new" and self.drag_start and self.app.current_frame is not None:
+            sx, sy = self.drag_start
+            ex, ey = event.x, event.y
+            if self.current_drag_id:
+                self.canvas.delete(self.current_drag_id)
+                self.current_drag_id = None
 
-        self.redraw_all_regions()
-        self.app.sidebar.update_region_display()
+            rx1, ry1 = self._canvas_to_real(min(sx, ex), min(sy, ey))
+            rx2, ry2 = self._canvas_to_real(max(sx, ex), max(sy, ey))
+
+            h, w = self.app.current_frame.shape[:2]
+            x = max(0, int(rx1))
+            y = max(0, int(ry1))
+            rw = min(w - x, int(rx2 - rx1))
+            rh = min(h - y, int(ry2 - ry1))
+
+            if rw >= 8 and rh >= 8:
+                new_box = (x, y, rw, rh)
+                if not hasattr(self.app, "regions") or not self.app.regions:
+                    self.app.regions = [new_box]
+                    self.selected_box_idx = 0
+                else:
+                    self.app.regions.append(new_box)
+                    self.selected_box_idx = len(self.app.regions) - 1
+
+                self.app.region = new_box
+                self.redraw_all_regions()
+                self.app.sidebar.update_region_display()
+
+        self.drag_start = None
+        self.drag_orig_box = None
+        self.active_handle = None
+
 
 
 # ──────────────────────────────────────────────
@@ -505,8 +770,43 @@ class ControlSidebar(ctk.CTkFrame):
                            border_width=1, border_color=BORDER_DEFAULT)
         sec.pack(fill=tk.X, padx=8, pady=3)
 
-        grid = ctk.CTkFrame(sec, fg_color="transparent")
-        grid.pack(fill=tk.X, padx=6, pady=(4, 2))
+        # ─── Tool Selector: Box vs Brush ──────────────────────
+        self.tool_mode_var = ctk.StringVar(value="🔲 Box Select")
+        self.tool_segmented = ctk.CTkSegmentedButton(
+            sec, values=["🔲 Box Select", "🖌️ Freeform Brush"],
+            variable=self.tool_mode_var, command=self._on_tool_mode_change,
+            height=28, corner_radius=4, font=ctk.CTkFont(size=10, weight="bold"),
+            selected_color=ACCENT_PRIMARY, selected_hover_color=ACCENT_PRIMARY
+        )
+        self.tool_segmented.pack(fill=tk.X, padx=6, pady=(6, 4))
+
+        # ─── BOX MANAGEMENT SUB-FRAME ─────────────────────────
+        self.box_tools_frame = ctk.CTkFrame(sec, fg_color="transparent")
+        self.box_tools_frame.pack(fill=tk.X, padx=6, pady=2)
+
+        # Box selector & deletion row
+        box_ctrl_row = ctk.CTkFrame(self.box_tools_frame, fg_color="transparent")
+        box_ctrl_row.pack(fill=tk.X, pady=(0, 4))
+
+        self.active_box_var = ctk.StringVar(value="Box 1 (R1)")
+        self.box_dropdown = ctk.CTkOptionMenu(
+            box_ctrl_row, variable=self.active_box_var, values=["Box 1 (R1)"],
+            command=self._on_box_selected_from_menu, height=24, width=120,
+            corner_radius=4, font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, button_color=BG_SURFACE_STRONG
+        )
+        self.box_dropdown.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+
+        self.del_box_btn = ctk.CTkButton(
+            box_ctrl_row, text="🗑️ Delete", command=self._delete_current_box,
+            height=24, width=64, corner_radius=4, font=ctk.CTkFont(size=10),
+            fg_color="#C93636", hover_color="#A82828", text_color="#FFFFFF"
+        )
+        self.del_box_btn.pack(side=tk.LEFT, padx=(2, 0))
+
+        # Coordinate Grid for active box
+        grid = ctk.CTkFrame(self.box_tools_frame, fg_color="transparent")
+        grid.pack(fill=tk.X, pady=(2, 2))
 
         self.coord_vars = {}
         for idx, (label, var_name) in enumerate([("X", "x"), ("Y", "y"), ("W", "w"), ("H", "h")]):
@@ -520,9 +820,11 @@ class ControlSidebar(ctk.CTkFrame):
                                  border_color=BORDER_STRONG, fg_color=BG_CANVAS, text_color=TEXT_PRIMARY,
                                  font=ctk.CTkFont(size=10))
             entry.grid(row=row, column=col+1, padx=(1, 4), pady=1)
+            entry.bind("<FocusOut>", lambda e: self._apply_manual())
+            entry.bind("<Return>", lambda e: self._apply_manual())
 
-        btn_row = ctk.CTkFrame(sec, fg_color="transparent")
-        btn_row.pack(fill=tk.X, padx=6, pady=(3, 3))
+        btn_row = ctk.CTkFrame(self.box_tools_frame, fg_color="transparent")
+        btn_row.pack(fill=tk.X, pady=(3, 2))
 
         ctk.CTkButton(btn_row, text="Auto Detect", command=self._auto_detect,
                       height=24, corner_radius=4, font=ctk.CTkFont(size=10),
@@ -532,16 +834,54 @@ class ControlSidebar(ctk.CTkFrame):
                       height=24, corner_radius=4, font=ctk.CTkFont(size=10, weight="bold"),
                       fg_color=BG_CANVAS, text_color=ACCENT_PRIMARY, border_width=1, border_color=ACCENT_PRIMARY,
                       hover_color=BG_SURFACE_STRONG).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 2))
-        ctk.CTkButton(btn_row, text="Clear", command=self._clear_region,
+        ctk.CTkButton(btn_row, text="Clear All", command=self._clear_region,
                       height=24, corner_radius=4, font=ctk.CTkFont(size=10),
-                      fg_color="#C93636", hover_color="#A82828", text_color="#FFFFFF",
-                      width=44).pack(side=tk.LEFT, padx=(2, 0))
+                      fg_color=BG_CANVAS, hover_color=BG_SURFACE_STRONG, text_color=TEXT_SECONDARY,
+                      border_width=1, border_color=BORDER_STRONG, width=54).pack(side=tk.LEFT, padx=(2, 0))
 
+        # ─── BRUSH TOOLS SUB-FRAME ────────────────────────────
+        self.brush_tools_frame = ctk.CTkFrame(sec, fg_color="transparent")
+
+        b_size_row = ctk.CTkFrame(self.brush_tools_frame, fg_color="transparent")
+        b_size_row.pack(fill=tk.X, pady=(2, 2))
+        ctk.CTkLabel(b_size_row, text="Brush Size:", font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color=TEXT_PRIMARY).pack(side=tk.LEFT)
+        self.brush_size_label = ctk.CTkLabel(b_size_row, text="30 px", font=ctk.CTkFont(size=10, weight="bold"),
+                                             text_color=ACCENT_PRIMARY)
+        self.brush_size_label.pack(side=tk.RIGHT)
+
+        self.brush_size_slider = ctk.CTkSlider(
+            self.brush_tools_frame, from_=5, to=120, number_of_steps=23, height=12,
+            progress_color=ACCENT_PRIMARY, button_color="#111111", command=self._on_brush_size_slider
+        )
+        self.brush_size_slider.set(30)
+        self.brush_size_slider.pack(fill=tk.X, pady=(0, 4))
+
+        b_action_row = ctk.CTkFrame(self.brush_tools_frame, fg_color="transparent")
+        b_action_row.pack(fill=tk.X, pady=(2, 2))
+
+        self.brush_mode_var = ctk.StringVar(value="Draw")
+        self.brush_mode_seg = ctk.CTkSegmentedButton(
+            b_action_row, values=["Draw", "Erase"], variable=self.brush_mode_var,
+            command=self._on_brush_draw_erase_change, height=24, corner_radius=4,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            selected_color=ACCENT_PRIMARY, selected_hover_color=ACCENT_PRIMARY
+        )
+        self.brush_mode_seg.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+
+        ctk.CTkButton(
+            b_action_row, text="Clear Brush", command=self._clear_brush,
+            height=24, corner_radius=4, font=ctk.CTkFont(size=10),
+            fg_color=BG_CANVAS, hover_color=BG_SURFACE_STRONG, text_color=TEXT_SECONDARY,
+            border_width=1, border_color=BORDER_STRONG, width=70
+        ).pack(side=tk.LEFT, padx=(2, 0))
+
+        # ─── Region Count & Tracking ──────────────────────────
         self.region_count_lbl = ctk.CTkLabel(
             sec, text="1 Region Selected", font=ctk.CTkFont(size=9, weight="bold"),
             text_color=TEXT_MUTED
         )
-        self.region_count_lbl.pack(fill=tk.X, padx=8, pady=(1, 2))
+        self.region_count_lbl.pack(fill=tk.X, padx=8, pady=(2, 2))
 
         self.tracking_var = ctk.BooleanVar(value=False)
         self.tracking_switch = ctk.CTkSwitch(
@@ -665,15 +1005,83 @@ class ControlSidebar(ctk.CTkFrame):
         desc = "0 (Lossless)" if crf == 0 else f"{crf} (Pristine Master)" if crf <= 14 else f"{crf} (High Quality 4K)" if crf <= 18 else f"{crf} (Standard Web)" if crf <= 23 else f"{crf} (High Compression)"
         self.crf_val_label.configure(text=desc)
 
-    def update_region_display(self):
+    def _on_tool_mode_change(self, val):
+        if "Brush" in val:
+            self.box_tools_frame.pack_forget()
+            self.brush_tools_frame.pack(fill=tk.X, padx=6, pady=2)
+            self.app.canvas_workspace.set_tool_mode("brush" if self.brush_mode_var.get() == "Draw" else "eraser")
+        else:
+            self.brush_tools_frame.pack_forget()
+            self.box_tools_frame.pack(fill=tk.X, padx=6, pady=2)
+            self.app.canvas_workspace.set_tool_mode("box")
+
+    def _on_brush_size_slider(self, val):
+        size = int(val)
+        self.brush_size_label.configure(text=f"{size} px")
+        self.app.canvas_workspace.set_brush_size(size)
+
+    def _on_brush_draw_erase_change(self, val):
+        self.app.canvas_workspace.set_tool_mode("brush" if val == "Draw" else "eraser")
+
+    def _clear_brush(self):
+        if hasattr(self.app, "brush_mask") and self.app.brush_mask is not None:
+            self.app.brush_mask.fill(0)
+        if self.app.current_frame is not None:
+            self.app.canvas_workspace.show_frame(self.app.current_frame)
+        self.update_region_display()
+
+    def _on_box_selected_from_menu(self, val):
+        try:
+            # e.g. "Box 2 (R2)" -> index 1
+            idx = int(val.split(" ")[1]) - 1
+            all_r = self.app.get_all_regions()
+            if 0 <= idx < len(all_r):
+                self.app.canvas_workspace.selected_box_idx = idx
+                self.app.region = all_r[idx]
+                self.app.canvas_workspace.redraw_all_regions()
+                self.update_region_display(sync_dropdown=False)
+        except Exception:
+            pass
+
+    def _delete_current_box(self):
+        self.app.canvas_workspace.delete_selected_box()
+
+    def update_region_display(self, sync_dropdown=True):
         all_r = self.app.get_all_regions()
         count = len(all_r)
+        
+        has_brush = hasattr(self.app, "brush_mask") and self.app.brush_mask is not None and np.any(self.app.brush_mask > 0)
+        
         if hasattr(self, "region_count_lbl"):
-            txt = f"{count} Regions Active" if count > 1 else f"{count} Region Selected" if count == 1 else "No Region Selected"
+            if has_brush and count > 0:
+                txt = f"{count} Box{'es' if count>1 else ''} + Brush Active"
+            elif has_brush:
+                txt = "🖌️ Custom Brush Mask Active"
+            elif count > 1:
+                txt = f"{count} Regions Active"
+            elif count == 1:
+                txt = "1 Region Selected"
+            else:
+                txt = "No Region Selected"
             self.region_count_lbl.configure(text=txt)
 
-        if self.app.region:
-            x, y, w, h = self.app.region
+        # Update box options in dropdown menu
+        if sync_dropdown and hasattr(self, "box_dropdown"):
+            if count > 0:
+                options = [f"Box {i+1} (R{i+1})" for i in range(count)]
+                self.box_dropdown.configure(values=options)
+                cur_idx = getattr(self.app.canvas_workspace, "selected_box_idx", 0)
+                cur_idx = max(0, min(cur_idx, count - 1))
+                self.active_box_var.set(options[cur_idx])
+            else:
+                self.box_dropdown.configure(values=["No Boxes"])
+                self.active_box_var.set("No Boxes")
+
+        # Update coordinate inputs for the currently selected box
+        if all_r:
+            sel_idx = getattr(self.app.canvas_workspace, "selected_box_idx", 0)
+            sel_idx = max(0, min(sel_idx, len(all_r) - 1))
+            x, y, w, h = all_r[sel_idx]
             self.coord_vars["x"].set(str(x))
             self.coord_vars["y"].set(str(y))
             self.coord_vars["w"].set(str(w))
@@ -688,27 +1096,37 @@ class ControlSidebar(ctk.CTkFrame):
         )
 
     def _add_current_box_to_multi(self):
-        try:
-            x = int(self.coord_vars["x"].get())
-            y = int(self.coord_vars["y"].get())
-            w = int(self.coord_vars["w"].get())
-            h = int(self.coord_vars["h"].get())
-            if w < 5 or h < 5:
-                raise ValueError
-        except Exception:
-            messagebox.showwarning("Invalid Region", "Draw or enter valid X, Y, W, H values first.")
+        if self.app.current_frame is None:
+            messagebox.showwarning("No Media", "Open a file first.")
             return
 
-        roi = (x, y, w, h)
-        if roi not in self.app.regions:
-            self.app.regions.append(roi)
-        self.app.region = roi
+        h, w = self.app.current_frame.shape[:2]
+        # Create a new box offset or default center
+        all_r = self.app.get_all_regions()
+        if all_r:
+            last_x, last_y, last_w, last_h = all_r[-1]
+            new_x = min(w - last_w, last_x + 30)
+            new_y = min(h - last_h, last_y + 30)
+            new_box = (new_x, new_y, last_w, last_h)
+        else:
+            new_box = (int(w * 0.7), int(h * 0.8), int(w * 0.25), int(h * 0.12))
+
+        if not hasattr(self.app, "regions") or not self.app.regions:
+            self.app.regions = [new_box]
+            self.app.canvas_workspace.selected_box_idx = 0
+        else:
+            self.app.regions.append(new_box)
+            self.app.canvas_workspace.selected_box_idx = len(self.app.regions) - 1
+
+        self.app.region = new_box
         self.app.canvas_workspace.redraw_all_regions()
         self.update_region_display()
 
     def _clear_region(self):
         self.app.region = None
         self.app.regions = []
+        if hasattr(self.app, "brush_mask") and self.app.brush_mask is not None:
+            self.app.brush_mask.fill(0)
         for v in self.coord_vars.values():
             v.set("0")
         self.app.canvas_workspace.clear_region()
@@ -736,8 +1154,14 @@ class ControlSidebar(ctk.CTkFrame):
             messagebox.showinfo("Not Found", "Could not auto-detect watermark.\nPlease drag a box around it manually.")
             return
         self.app.region = region
+        if not hasattr(self.app, "regions") or not self.app.regions:
+            self.app.regions = [region]
+            self.app.canvas_workspace.selected_box_idx = 0
+        else:
+            self.app.regions.append(region)
+            self.app.canvas_workspace.selected_box_idx = len(self.app.regions) - 1
         self.update_region_display()
-        self.app.canvas_workspace.draw_region(region)
+        self.app.canvas_workspace.redraw_all_regions()
 
     def _apply_manual(self):
         try:
@@ -748,29 +1172,54 @@ class ControlSidebar(ctk.CTkFrame):
             if w < 5 or h < 5:
                 raise ValueError
         except Exception:
-            messagebox.showwarning("Invalid Region", "Enter valid integer X, Y, W, H values (min 5px).")
             return
-        self.app.region = (x, y, w, h)
-        self.app.canvas_workspace.draw_region(self.app.region)
+        
+        all_r = self.app.get_all_regions()
+        if all_r:
+            sel_idx = getattr(self.app.canvas_workspace, "selected_box_idx", 0)
+            sel_idx = max(0, min(sel_idx, len(all_r) - 1))
+            self.app.regions[sel_idx] = (x, y, w, h)
+            self.app.region = (x, y, w, h)
+        else:
+            self.app.region = (x, y, w, h)
+            self.app.regions = [self.app.region]
+            self.app.canvas_workspace.selected_box_idx = 0
 
-    def _clear_region(self):
-        self.app.region = None
-        for v in self.coord_vars.values():
-            v.set("0")
-        self.app.canvas_workspace.clear_region()
+        self.app.canvas_workspace.redraw_all_regions()
+        self.update_region_display()
 
     def _preview(self):
         if self.app.current_frame is None:
             messagebox.showwarning("No Media", "Open a file first.")
             return
-        if self.app.region is None:
-            messagebox.showwarning("No Region", "Select or detect a watermark region first.")
+        has_boxes = bool(self.app.get_all_regions())
+        has_brush = hasattr(self.app, "brush_mask") and self.app.brush_mask is not None and np.any(self.app.brush_mask > 0)
+        if not has_boxes and not has_brush:
+            messagebox.showwarning("No Region", "Please draw a box or paint over the watermark with the brush first.")
             return
 
         self.app._apply_settings()
         frame = self.app.current_frame.copy()
-        region = self.app.region
-        x, y, w, h = region
+
+        if has_brush:
+            coords = np.where(self.app.brush_mask > 0)
+            y1, y2 = int(np.min(coords[0])), int(np.max(coords[0]))
+            x1, x2 = int(np.min(coords[1])), int(np.max(coords[1]))
+            fh, fw = frame.shape[:2]
+            pad = int(40 * (max(fh, fw) / 1080.0))
+            roi_y1 = max(0, y1 - pad)
+            roi_y2 = min(fh, y2 + 1 + pad)
+            roi_x1 = max(0, x1 - pad)
+            roi_x2 = min(fw, x2 + 1 + pad)
+
+            roi_crop = frame[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+            mask_crop = self.app.brush_mask[roi_y1:roi_y2, roi_x1:roi_x2].copy()
+            inpainted_crop = vlr.inpaint_roi_batch([roi_crop], mask_crop)[0]
+            EditorialPreviewModal(self.app, roi_crop, inpainted_crop)
+            return
+
+        all_r = self.app.get_all_regions()
+        x, y, w, h = all_r[0]
         fh, fw = frame.shape[:2]
         pad = int(40 * (max(fh, fw) / 1080.0))
 
@@ -790,8 +1239,10 @@ class ControlSidebar(ctk.CTkFrame):
         if self.app.current_frame is None:
             messagebox.showwarning("No Media", "Open a file first.")
             return
-        if self.app.region is None:
-            messagebox.showwarning("No Region", "Select or detect a watermark region first.")
+        has_boxes = bool(self.app.get_all_regions())
+        has_brush = hasattr(self.app, "brush_mask") and self.app.brush_mask is not None and np.any(self.app.brush_mask > 0)
+        if not has_boxes and not has_brush:
+            messagebox.showwarning("No Region", "Please draw a box or paint over the watermark with the brush first.")
             return
         if self.app.processing:
             return
@@ -873,52 +1324,88 @@ class EditorialSuccessModal(ctk.CTkToplevel):
         super().__init__(parent)
         self.output_path = Path(output_path)
         self.title("Processing Complete")
-        self.geometry("540x380")
+        self.geometry("560x400")
         self.resizable(False, False)
+        self.configure(fg_color=BG_CANVAS)
+
+        # Center over parent
+        try:
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            x = px + max(0, (pw - 560) // 2)
+            y = py + max(0, (ph - 400) // 2)
+            self.geometry(f"560x400+{x}+{y}")
+        except Exception:
+            pass
 
         hdr = ctk.CTkFrame(self, fg_color="transparent")
-        hdr.pack(fill=tk.X, padx=20, pady=(20, 6))
+        hdr.pack(fill=tk.X, padx=24, pady=(20, 6))
 
-        ctk.CTkLabel(hdr, text="Processing Complete",
+        title_row = ctk.CTkFrame(hdr, fg_color="transparent")
+        title_row.pack(fill=tk.X)
+
+        ctk.CTkLabel(title_row, text="✓", font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color="#17824B").pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkLabel(title_row, text="Processing Complete",
                      font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(anchor="w")
-        ctk.CTkLabel(hdr, text="Media restored and exported successfully.",
-                     font=ctk.CTkFont(size=11), text_color=TEXT_MUTED).pack(anchor="w")
+                     text_color=TEXT_PRIMARY).pack(side=tk.LEFT)
+
+        ctk.CTkLabel(hdr, text="Media restored and exported with lossless quality.",
+                     font=ctk.CTkFont(size=11), text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
+
+        # Safe File Size and Metadata Calculation
+        try:
+            if self.output_path.exists():
+                file_size_mb = self.output_path.stat().st_size / (1024 * 1024)
+                file_size_str = f"{file_size_mb:.2f} MB"
+            else:
+                file_size_str = "Exported"
+        except Exception:
+            file_size_str = "N/A"
 
         card = ctk.CTkFrame(self, corner_radius=8, fg_color=BG_SURFACE,
                             border_width=1, border_color=BORDER_DEFAULT)
-        card.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        card.pack(fill=tk.BOTH, expand=True, padx=24, pady=10)
 
-        file_size = self.output_path.stat().st_size / (1024 * 1024)
-        info_lines = [
-            f"File Name   : {self.output_path.name}",
-            f"Format      : {self.output_path.suffix.upper()} (Exact Audio & Video Preservation)",
-            f"File Size   : {file_size:.2f} MB",
-            f"Render Time : {vlr.format_time(elapsed_time)}",
+        grid = ctk.CTkFrame(card, fg_color="transparent")
+        grid.pack(fill=tk.BOTH, expand=True, padx=16, pady=14)
+
+        time_str = vlr.format_time(elapsed_time) if hasattr(vlr, "format_time") else f"{elapsed_time:.1f}s"
+
+        details = [
+            ("File Name", self.output_path.name),
+            ("Destination", str(self.output_path.parent)),
+            ("Format", f"{self.output_path.suffix.upper()} (Audio & Video Preserved)"),
+            ("File Size", file_size_str),
+            ("Render Time", time_str),
         ]
         if throughput_fps:
-            info_lines.append(f"Throughput  : {throughput_fps:.1f} FPS")
+            details.append(("Throughput", f"{throughput_fps:.1f} FPS"))
 
-        info_text = "\n".join(info_lines)
-        ctk.CTkLabel(card, text=info_text, font=ctk.CTkFont(size=11, family="Consolas"),
-                     text_color=TEXT_PRIMARY, justify=tk.LEFT, anchor="w").pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+        for r_idx, (label, val) in enumerate(details):
+            ctk.CTkLabel(grid, text=f"{label}:", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                         text_color=TEXT_SECONDARY, anchor="w", width=100).grid(row=r_idx, column=0, sticky="w", pady=3)
+            ctk.CTkLabel(grid, text=val, font=ctk.CTkFont(family="Consolas" if label != "Destination" else "Segoe UI", size=11),
+                         text_color=TEXT_PRIMARY, anchor="w").grid(row=r_idx, column=1, sticky="w", padx=(10, 0), pady=3)
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill=tk.X, padx=20, pady=(4, 20))
+        btn_frame.pack(fill=tk.X, padx=24, pady=(6, 20))
 
-        ctk.CTkButton(btn_frame, text="Open File →", font=ctk.CTkFont(size=11, weight="bold"),
+        ctk.CTkButton(btn_frame, text="▶ Open File", font=ctk.CTkFont(size=11, weight="bold"),
                       fg_color="#111111", hover_color=ACCENT_PRIMARY, text_color="#FFFFFF",
-                      corner_radius=4, command=self._open_file, width=120, height=36).pack(side=tk.LEFT, padx=(0, 6))
+                      corner_radius=4, command=self._open_file, width=130, height=36).pack(side=tk.LEFT, padx=(0, 8))
 
-        ctk.CTkButton(btn_frame, text="Show in Folder", font=ctk.CTkFont(size=11),
+        ctk.CTkButton(btn_frame, text="📁 Show in Folder", font=ctk.CTkFont(size=11),
                       fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, border_width=1, border_color=BORDER_STRONG,
                       hover_color=BG_SURFACE_STRONG, corner_radius=4,
-                      command=self._open_folder, width=130, height=36).pack(side=tk.LEFT, padx=4)
+                      command=self._open_folder, width=140, height=36).pack(side=tk.LEFT, padx=4)
 
         ctk.CTkButton(btn_frame, text="Close", font=ctk.CTkFont(size=11),
                       fg_color=BG_CANVAS, text_color=TEXT_MUTED, border_width=1, border_color=BORDER_DEFAULT,
                       hover_color=BG_SURFACE, corner_radius=4,
-                      command=self.destroy, width=70, height=36).pack(side=tk.RIGHT, padx=(6, 0))
+                      command=self.destroy, width=80, height=36).pack(side=tk.RIGHT)
 
         self.transient(parent)
         self.grab_set()
@@ -945,6 +1432,7 @@ class EditorialSuccessModal(ctk.CTkToplevel):
                 subprocess.run(["xdg-open", str(folder)])
         except Exception as e:
             messagebox.showerror("Error", f"Cannot open folder: {e}")
+
 
 
 # ──────────────────────────────────────────────
@@ -1777,16 +2265,29 @@ class WatermarkStudioApp(ctk.CTk):
         vlr.CRF_QUALITY = int(self.sidebar.crf_slider.get())
 
     def get_all_regions(self):
-        """Retrieve all active watermark bounding boxes."""
+        """Retrieve all active watermark bounding boxes (including brush mask bounds)."""
+        res = []
         if hasattr(self, "regions") and self.regions:
-            return list(self.regions)
+            res = list(self.regions)
         elif hasattr(self, "region") and self.region:
-            return [self.region]
-        return []
+            res = [self.region]
+
+        if not res and hasattr(self, "brush_mask") and self.brush_mask is not None:
+            coords = np.where(self.brush_mask > 127)
+            if len(coords[0]) > 0:
+                y1, y2 = int(np.min(coords[0])), int(np.max(coords[0]))
+                x1, x2 = int(np.min(coords[1])), int(np.max(coords[1]))
+                res = [(x1, y1, max(5, x2 - x1), max(5, y2 - y1))]
+        return res
 
     def start_processing(self):
         self._apply_settings()
         self.cancel_event.clear()
+
+        all_regions = self.get_all_regions()
+        if not all_regions:
+            messagebox.showwarning("No Region", "Please draw a box or paint over the watermark with the brush first.")
+            return
 
         output_path = self.current_file.parent / f"{self.current_file.stem}_clean{self.current_file.suffix}"
 
@@ -1801,16 +2302,19 @@ class WatermarkStudioApp(ctk.CTk):
 
         self._poll_progress()
 
+        has_brush = hasattr(self, "brush_mask") and self.brush_mask is not None and np.any(self.brush_mask > 0)
+
         def worker():
             if self.active_view_name == "image":
                 success = vlr.process_image(
                     str(self.current_file), str(output_path),
-                    self.region, progress_callback=gui_progress
+                    all_regions,
+                    custom_mask=self.brush_mask if has_brush else None
                 )
             else:
                 success = vlr.process_video(
                     str(self.current_file), str(output_path),
-                    self.region, self.video_info,
+                    all_regions, self.video_info,
                     cancel_event=self.cancel_event,
                     progress_callback=gui_progress
                 )
