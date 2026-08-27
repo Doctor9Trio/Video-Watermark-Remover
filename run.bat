@@ -28,6 +28,9 @@ if not exist "venv\Scripts\activate.bat" (
 )
 
 :: 3. Launch GUI
+echo ============================================================
+echo   Launching Watermark Studio Pro...
+echo ============================================================
 python "%~dp0gui_app.py" %*
 
 if %ERRORLEVEL% NEQ 0 (

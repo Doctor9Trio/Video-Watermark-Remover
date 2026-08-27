@@ -38,6 +38,11 @@ test_output/
 *.mkv
 *.webm
 *.avi
+*.png
+*.jpg
+*.jpeg
+*.webp
+!screenshots/*.png
 !assets/*.png
 !assets/*.jpg
 

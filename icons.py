@@ -117,15 +117,27 @@ def _draw_lucide_icon(name, size=20, color="#111111"):
     return img.resize((size, size), Image.Resampling.LANCZOS)
 
 
+_ICON_CACHE = {}
+
 def get_icon(name, size=18):
-    """Returns a theme-adaptive CTkImage (#111111 in Light, #F5F5F2 in Dark)."""
+    """Returns a theme-adaptive CTkImage (#111111 in Light, #F5F5F2 in Dark), cached for high performance."""
+    key = ("standard", name, size)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
     light_img = _draw_lucide_icon(name, size=size, color="#111111")
     dark_img = _draw_lucide_icon(name, size=size, color="#F5F5F2")
-    return ctk.CTkImage(light_image=light_img, dark_image=dark_img, size=(size, size))
+    icon = ctk.CTkImage(light_image=light_img, dark_image=dark_img, size=(size, size))
+    _ICON_CACHE[key] = icon
+    return icon
 
 
 def get_accent_icon(name, size=18):
-    """Returns an accent-colored CTkImage (#F05A28 in Light, #FF6B36 in Dark)."""
+    """Returns an accent-colored CTkImage (#F05A28 in Light, #FF6B36 in Dark), cached for high performance."""
+    key = ("accent", name, size)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
     light_img = _draw_lucide_icon(name, size=size, color="#F05A28")
     dark_img = _draw_lucide_icon(name, size=size, color="#FF6B36")
-    return ctk.CTkImage(light_image=light_img, dark_image=dark_img, size=(size, size))
+    icon = ctk.CTkImage(light_image=light_img, dark_image=dark_img, size=(size, size))
+    _ICON_CACHE[key] = icon
+    return icon

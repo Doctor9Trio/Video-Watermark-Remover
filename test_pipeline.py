@@ -61,19 +61,61 @@ def test_video_pipeline():
         writer.release()
 
     info = vlr.get_video_info(video_path)
-    vlr.INPAINT_ENGINE = "fast"
     region = (3180, 100, 600, 120)
-    ok = vlr.process_video(video_path, out_path, region, info)
-    assert ok, "Video inpainting failed!"
-    assert out_path.exists(), "Output video file not created!"
-    print(f"  [PASS] Video inpainting successful! Output: {out_path.name}")
+    for eng in ["fast_v2", "fast_v1"]:
+        vlr.INPAINT_ENGINE = eng
+        out_path = out_dir / f"clip_4k_test_{eng}.mov"
+        ok = vlr.process_video(video_path, out_path, region, info)
+        assert ok, f"Video inpainting failed for {eng}!"
+        assert out_path.exists(), f"Output video file not created for {eng}!"
+        print(f"  [PASS] Video inpainting successful for '{eng}'! Output: {out_path.name}")
+
+def test_all_engines():
+    print("\n--- Testing Inpainting Engines (Blur, Clone, Fast, Seamless Pro) ---")
+    out_dir = Path("test_output")
+    out_dir.mkdir(exist_ok=True)
+    img_path = out_dir / "test_input.png"
+    
+    region = create_synthetic_image(img_path)
+    
+    for engine in ["seamless_pro", "blur", "clone", "fast", "opencv"]:
+        vlr.INPAINT_ENGINE = engine
+        vlr.PRECISE_MASK = True
+        vlr.FEATHER_RADIUS = 3
+        out_path = out_dir / f"test_cleaned_{engine}.png"
+        ok = vlr.process_image(img_path, out_path, region)
+        assert ok, f"Engine {engine} failed!"
+        assert out_path.exists(), f"Engine {engine} output missing!"
+        print(f"  [PASS] Engine '{engine}' successfully processed image!")
+
+def test_multi_region():
+    print("\n--- Testing Multi-Region Simultaneous Inpainting ---")
+    out_dir = Path("test_output")
+    out_dir.mkdir(exist_ok=True)
+    img_path = out_dir / "test_multi_in.png"
+    out_path = out_dir / "test_multi_out.png"
+
+    # Create image with 2 separate watermarks (top-left and bottom-right)
+    img = np.full((1080, 1920, 3), (240, 240, 240), dtype=np.uint8)
+    cv2.putText(img, "TOP_LEFT_WATERMARK", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (10, 10, 10), 2)
+    cv2.putText(img, "BOTTOM_RIGHT_WATERMARK", (1400, 1020), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (10, 10, 10), 2)
+    cv2.imwrite(str(img_path), img)
+
+    regions = [(40, 40, 420, 60), (1380, 980, 500, 60)]
+    ok = vlr.process_image(img_path, out_path, regions)
+    assert ok, "Multi-region image inpainting failed!"
+    assert out_path.exists(), "Multi-region output missing!"
+    print(f"  [PASS] Multi-region simultaneous inpainting passed! Output: {out_path.name}")
+
 
 if __name__ == "__main__":
     print("=================================================================")
     print("  WATERMARK STUDIO PRO v7.0 - AUTOMATED VERIFICATION SUITE       ")
     print("=================================================================")
     test_image_inpainting()
+    test_all_engines()
     test_video_pipeline()
+    test_multi_region()
     print("\n=================================================================")
     print("  [PASS] ALL STUDIO v7.0 TESTS COMPLETED SUCCESSFULLY!           ")
     print("=================================================================")

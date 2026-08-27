@@ -67,8 +67,17 @@ class MediaCanvasViewport(ctk.CTkFrame):
         self.offset_y = 0
         self.photo = None
         self.image_id = None
-        self.rect_id = None
+        self.rect_ids = []
         self.drag_start = None
+        self.current_drag_id = None
+
+        # Split Wiper State
+        self.split_wiper_active = False
+        self.split_pos = 0.5
+        self.clean_preview_frame = None
+        self.wiper_line_id = None
+        self.wiper_label_left = None
+        self.wiper_label_right = None
 
         self.canvas = tk.Canvas(self, bg="#151515", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -76,14 +85,17 @@ class MediaCanvasViewport(ctk.CTkFrame):
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Configure>", self._on_resize)
 
+        self._resize_timer = None
         self.render_placeholder()
 
     def render_placeholder(self):
         self.canvas.delete("all")
         self.image_id = None
-        self.rect_id = None
+        self.rect_ids = []
+        self.current_drag_id = None
         cw = max(100, self.canvas.winfo_width())
         ch = max(100, self.canvas.winfo_height())
         cx, cy = cw // 2, ch // 2
@@ -92,16 +104,22 @@ class MediaCanvasViewport(ctk.CTkFrame):
 
         self.canvas.create_text(
             cx, cy - 16,
-            text=f"Drag & Select Watermark Region",
+            text="Drag & Select Watermark Region",
             font=("Segoe UI", 14, "bold"), fill="#F5F5F2"
         )
         self.canvas.create_text(
             cx, cy + 14,
-            text=f"Open a {mode_text} file to begin | 4K UHD 60FPS • MOV • MP4 • MKV • PNG • JPG • WEBP",
+            text=f"Open a {mode_text} file to begin | 4K UHD 60FPS • Multi-Region • NVENC 2000+ FPS",
             font=("Segoe UI", 10), fill="#85857F"
         )
 
     def _on_resize(self, event):
+        if self._resize_timer:
+            self.after_cancel(self._resize_timer)
+        self._resize_timer = self.after(30, self._apply_resize)
+
+    def _apply_resize(self):
+        self._resize_timer = None
         if self.app.current_frame is not None:
             self.show_frame(self.app.current_frame)
         else:
@@ -120,37 +138,112 @@ class MediaCanvasViewport(ctk.CTkFrame):
         self.offset_x = (cw - disp_w) // 2
         self.offset_y = (ch - disp_h) // 2
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if self.split_wiper_active and self.clean_preview_frame is not None:
+            split_pixel = int(w * self.split_pos)
+            composite = frame.copy()
+            if split_pixel < w:
+                composite[:, split_pixel:] = self.clean_preview_frame[:, split_pixel:]
+            rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
         pil_img = Image.fromarray(rgb).resize((disp_w, disp_h), Image.Resampling.BILINEAR)
         self.photo = ImageTk.PhotoImage(pil_img)
 
-        self.canvas.delete("all")
-        self.image_id = self.canvas.create_image(
-            self.offset_x, self.offset_y, anchor=tk.NW, image=self.photo
-        )
-        self.rect_id = None
+        if self.image_id is None:
+            self.canvas.delete("all")
+            self.image_id = self.canvas.create_image(
+                self.offset_x, self.offset_y, anchor=tk.NW, image=self.photo
+            )
+        else:
+            self.canvas.coords(self.image_id, self.offset_x, self.offset_y)
+            self.canvas.itemconfig(self.image_id, image=self.photo)
 
-        if self.app.region:
-            self.draw_region(self.app.region)
+        if self.split_wiper_active:
+            self._draw_wiper_overlays(disp_w, disp_h)
+        else:
+            self.redraw_all_regions()
+
+    def toggle_split_wiper(self, enable=None):
+        if enable is None:
+            self.split_wiper_active = not self.split_wiper_active
+        else:
+            self.split_wiper_active = bool(enable)
+
+        if self.split_wiper_active:
+            if self.app.current_frame is None:
+                self.split_wiper_active = False
+                return
+            all_r = self.app.get_all_regions()
+            if not all_r:
+                messagebox.showwarning("No Region", "Select at least one watermark region to preview.")
+                self.split_wiper_active = False
+                return
+            self.app._apply_settings()
+            clean = self.app.current_frame.copy()
+            for (x, y, w, h) in all_r:
+                fh, fw = clean.shape[:2]
+                pad = int(40 * (max(fh, fw) / 1080.0))
+                y1 = max(0, y - pad)
+                y2 = min(fh, y + h + pad)
+                x1 = max(0, x - pad)
+                x2 = min(fw, x + w + pad)
+                roi_crop = clean[y1:y2, x1:x2].copy()
+                mask_crop = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
+                mask_crop[y - y1:y - y1 + h, x - x1:x - x1 + w] = 255
+                inpainted_crop = vlr.inpaint_roi_batch([roi_crop], mask_crop)[0]
+                clean[y1:y2, x1:x2] = inpainted_crop
+            self.clean_preview_frame = clean
+        else:
+            self.clean_preview_frame = None
+
+        if self.app.current_frame is not None:
+            self.show_frame(self.app.current_frame)
+
+    def _draw_wiper_overlays(self, disp_w, disp_h):
+        for rid in self.rect_ids:
+            self.canvas.delete(rid)
+        self.rect_ids = []
+
+        wx = self.offset_x + int(disp_w * self.split_pos)
+        self.rect_ids.append(self.canvas.create_line(wx, self.offset_y, wx, self.offset_y + disp_h, fill="#FFFFFF", width=2))
+        self.rect_ids.append(self.canvas.create_line(wx, self.offset_y, wx, self.offset_y + disp_h, fill=ACCENT_PRIMARY, width=1, dash=(4, 4)))
+
+        # Badges
+        self.rect_ids.append(self.canvas.create_text(
+            self.offset_x + 60, self.offset_y + 18, text="ORIGINAL", font=("Segoe UI", 9, "bold"), fill="#C93636"
+        ))
+        self.rect_ids.append(self.canvas.create_text(
+            self.offset_x + disp_w - 60, self.offset_y + 18, text="RESTORED", font=("Segoe UI", 9, "bold"), fill="#17824B"
+        ))
+
+    def redraw_all_regions(self):
+        for rid in self.rect_ids:
+            self.canvas.delete(rid)
+        self.rect_ids = []
+
+        all_r = self.app.get_all_regions()
+        colors = [ACCENT_PRIMARY, "#17824B", "#2A70E8", "#D97706", "#9333EA"]
+        for idx, (x, y, w, h) in enumerate(all_r):
+            cx1 = self.offset_x + int(x * self.scale)
+            cy1 = self.offset_y + int(y * self.scale)
+            cx2 = self.offset_x + int((x + w) * self.scale)
+            cy2 = self.offset_y + int((y + h) * self.scale)
+            col = colors[idx % len(colors)]
+            rect_id = self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline=col, width=2, dash=(6, 4))
+            txt_id = self.canvas.create_text(cx1 + 12, cy1 - 8, text=f"R{idx+1}", font=("Segoe UI", 8, "bold"), fill=col)
+            self.rect_ids.extend([rect_id, txt_id])
 
     def draw_region(self, region):
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-        x, y, w, h = region
-        cx1 = self.offset_x + int(x * self.scale)
-        cy1 = self.offset_y + int(y * self.scale)
-        cx2 = self.offset_x + int((x + w) * self.scale)
-        cy2 = self.offset_y + int((y + h) * self.scale)
-
-        self.rect_id = self.canvas.create_rectangle(
-            cx1, cy1, cx2, cy2,
-            outline=ACCENT_PRIMARY, width=2, dash=(6, 4)
-        )
+        self.redraw_all_regions()
 
     def clear_region(self):
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
-            self.rect_id = None
+        for rid in self.rect_ids:
+            self.canvas.delete(rid)
+        self.rect_ids = []
+        if self.current_drag_id:
+            self.canvas.delete(self.current_drag_id)
+            self.current_drag_id = None
 
     def _canvas_to_real(self, cx, cy):
         rx = (cx - self.offset_x) / max(self.scale, 1e-6)
@@ -160,27 +253,53 @@ class MediaCanvasViewport(ctk.CTkFrame):
     def _on_press(self, event):
         if self.app.current_frame is None or self.app.processing:
             return
+        if self.split_wiper_active:
+            cw = self.canvas.winfo_width()
+            h, w = self.app.current_frame.shape[:2]
+            disp_w = max(1, int(w * self.scale))
+            rel_x = (event.x - self.offset_x) / max(disp_w, 1)
+            self.split_pos = max(0.02, min(0.98, rel_x))
+            self.show_frame(self.app.current_frame)
+            return
+
         self.drag_start = (event.x, event.y)
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
+        if self.current_drag_id:
+            self.canvas.delete(self.current_drag_id)
+
+    def _on_motion(self, event):
+        if self.split_wiper_active and self.app.current_frame is not None:
+            if event.state & 0x0100:  # Button 1 pressed
+                h, w = self.app.current_frame.shape[:2]
+                disp_w = max(1, int(w * self.scale))
+                rel_x = (event.x - self.offset_x) / max(disp_w, 1)
+                self.split_pos = max(0.02, min(0.98, rel_x))
+                self.show_frame(self.app.current_frame)
 
     def _on_drag(self, event):
+        if self.split_wiper_active:
+            self._on_motion(event)
+            return
         if not self.drag_start:
             return
-        if self.rect_id:
-            self.canvas.delete(self.rect_id)
+        if self.current_drag_id:
+            self.canvas.delete(self.current_drag_id)
         sx, sy = self.drag_start
-        self.rect_id = self.canvas.create_rectangle(
+        self.current_drag_id = self.canvas.create_rectangle(
             sx, sy, event.x, event.y,
             outline=ACCENT_PRIMARY, width=2, dash=(6, 4)
         )
 
     def _on_release(self, event):
+        if self.split_wiper_active:
+            return
         if not self.drag_start or self.app.current_frame is None:
             return
         sx, sy = self.drag_start
         ex, ey = event.x, event.y
         self.drag_start = None
+        if self.current_drag_id:
+            self.canvas.delete(self.current_drag_id)
+            self.current_drag_id = None
 
         rx1, ry1 = self._canvas_to_real(min(sx, ex), min(sy, ey))
         rx2, ry2 = self._canvas_to_real(max(sx, ex), max(sy, ey))
@@ -195,7 +314,12 @@ class MediaCanvasViewport(ctk.CTkFrame):
             return
 
         self.app.region = (x, y, rw, rh)
-        self.draw_region(self.app.region)
+        if not self.app.regions:
+            self.app.regions = [self.app.region]
+        else:
+            self.app.regions[0] = self.app.region
+
+        self.redraw_all_regions()
         self.app.sidebar.update_region_display()
 
 
@@ -218,7 +342,7 @@ class ControlSidebar(ctk.CTkFrame):
         self._build_action_section()
 
     def _build_header_section(self):
-        hw = vlr.get_hardware_info()
+        hw = vlr.get_hardware_info(quick=True)
         card = ctk.CTkFrame(self, corner_radius=6, fg_color=BG_SURFACE,
                             border_width=1, border_color=BORDER_DEFAULT)
         card.pack(fill=tk.X, padx=8, pady=(8, 3))
@@ -227,10 +351,12 @@ class ControlSidebar(ctk.CTkFrame):
         row.pack(fill=tk.X, padx=8, pady=(6, 2))
 
         dot_color = "#17824B" if hw["has_cuda"] else "#A96500"
-        ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=9), text_color=dot_color).pack(side=tk.LEFT, padx=(0, 4))
+        self.header_dot_lbl = ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=9), text_color=dot_color)
+        self.header_dot_lbl.pack(side=tk.LEFT, padx=(0, 4))
         gpu_name = hw['gpu_name'] if hw["has_cuda"] else "CPU Native"
-        ctk.CTkLabel(row, text=gpu_name, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(side=tk.LEFT)
+        self.header_gpu_lbl = ctk.CTkLabel(row, text=gpu_name, font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+                                          text_color=TEXT_PRIMARY)
+        self.header_gpu_lbl.pack(side=tk.LEFT)
 
         self.status_tag = ctk.CTkLabel(row, text="Ready", font=ctk.CTkFont(size=9, weight="bold"),
                                        fg_color=BG_SURFACE_STRONG, text_color=TEXT_SECONDARY,
@@ -279,6 +405,7 @@ class ControlSidebar(ctk.CTkFrame):
 
         preset_names = [
             "Custom (Draw Box)",
+            "Raylight Pill Badge",
             "Google Gemini Sparkle",
             "NotebookLM Badge",
             "TikTok Watermark",
@@ -286,22 +413,79 @@ class ControlSidebar(ctk.CTkFrame):
             "CapCut Outro Stamp",
             "Bandicam Top Header"
         ]
+        self._load_custom_presets_into_list(preset_names)
         self.preset_var = ctk.StringVar(value="Custom (Draw Box)")
+
+        preset_row = ctk.CTkFrame(sec, fg_color="transparent")
+        preset_row.pack(fill=tk.X, padx=6, pady=4)
+
         self.preset_menu = ctk.CTkOptionMenu(
-            sec, variable=self.preset_var, values=preset_names,
+            preset_row, variable=self.preset_var, values=preset_names,
             command=self._on_preset_selected, height=26, corner_radius=4,
             fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, button_color=BG_SURFACE_STRONG,
             font=ctk.CTkFont(size=10)
         )
-        self.preset_menu.pack(fill=tk.X, padx=6, pady=5)
+        self.preset_menu.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+
+        ctk.CTkButton(
+            preset_row, text="+ Save", width=48, height=26, corner_radius=4,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, border_width=1, border_color=BORDER_STRONG,
+            hover_color=BG_SURFACE_STRONG, command=self._save_custom_preset
+        ).pack(side=tk.LEFT)
+
+    def _load_custom_presets_into_list(self, preset_list):
+        self.custom_presets = {}
+        preset_file = Path(__file__).parent / "presets.json"
+        if preset_file.exists():
+            try:
+                import json
+                with open(preset_file, "r", encoding="utf-8") as f:
+                    self.custom_presets = json.load(f)
+                for name in self.custom_presets:
+                    if name not in preset_list:
+                        preset_list.append(name)
+            except Exception:
+                pass
+
+    def _save_custom_preset(self):
+        if self.app.region is None:
+            messagebox.showwarning("No Region", "Draw or enter a watermark region first to save it as a preset.")
+            return
+        dialog = ctk.CTkInputDialog(text="Enter preset name (e.g. 'Company Watermark'):", title="Save Preset")
+        name = dialog.get_input()
+        if name and name.strip():
+            name = name.strip()
+            self.custom_presets[name] = list(self.app.region)
+            preset_file = Path(__file__).parent / "presets.json"
+            try:
+                import json
+                with open(preset_file, "w", encoding="utf-8") as f:
+                    json.dump(self.custom_presets, f, indent=2)
+                values = list(self.preset_menu.cget("values"))
+                if name not in values:
+                    values.append(name)
+                    self.preset_menu.configure(values=values)
+                self.preset_var.set(name)
+                messagebox.showinfo("Saved", f"Preset '{name}' saved successfully!")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save preset: {e}")
 
     def _on_preset_selected(self, val):
+        if val in getattr(self, "custom_presets", {}):
+            roi = tuple(self.custom_presets[val])
+            self.app.region = roi
+            self.update_region_display()
+            self.app.canvas_workspace.draw_region(roi)
+            return
+
         if self.app.current_frame is None:
             messagebox.showwarning("No Media", "Open a video or image first to apply preset.")
             return
 
         h, w = self.app.current_frame.shape[:2]
         key_map = {
+            "Raylight Pill Badge": "raylight",
             "Google Gemini Sparkle": "gemini",
             "NotebookLM Badge": "notebooklm",
             "TikTok Watermark": "tiktok",
@@ -344,14 +528,20 @@ class ControlSidebar(ctk.CTkFrame):
                       height=24, corner_radius=4, font=ctk.CTkFont(size=10),
                       fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, border_width=1, border_color=BORDER_STRONG,
                       hover_color=BG_SURFACE_STRONG).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
-        ctk.CTkButton(btn_row, text="Apply", command=self._apply_manual,
-                      height=24, corner_radius=4, font=ctk.CTkFont(size=10),
-                      fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, border_width=1, border_color=BORDER_STRONG,
+        ctk.CTkButton(btn_row, text="+ Add Box", command=self._add_current_box_to_multi,
+                      height=24, corner_radius=4, font=ctk.CTkFont(size=10, weight="bold"),
+                      fg_color=BG_CANVAS, text_color=ACCENT_PRIMARY, border_width=1, border_color=ACCENT_PRIMARY,
                       hover_color=BG_SURFACE_STRONG).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 2))
         ctk.CTkButton(btn_row, text="Clear", command=self._clear_region,
                       height=24, corner_radius=4, font=ctk.CTkFont(size=10),
                       fg_color="#C93636", hover_color="#A82828", text_color="#FFFFFF",
                       width=44).pack(side=tk.LEFT, padx=(2, 0))
+
+        self.region_count_lbl = ctk.CTkLabel(
+            sec, text="1 Region Selected", font=ctk.CTkFont(size=9, weight="bold"),
+            text_color=TEXT_MUTED
+        )
+        self.region_count_lbl.pack(fill=tk.X, padx=8, pady=(1, 2))
 
         self.tracking_var = ctk.BooleanVar(value=False)
         self.tracking_switch = ctk.CTkSwitch(
@@ -365,10 +555,10 @@ class ControlSidebar(ctk.CTkFrame):
                            border_width=1, border_color=BORDER_DEFAULT)
         sec.pack(fill=tk.X, padx=8, pady=3)
 
-        self.engine_var = ctk.StringVar(value="Seamless Pro (Best Quality)")
+        self.engine_var = ctk.StringVar(value="Seamless Pro (Best Quality Neural AI)")
         engine_options = [
-            "Seamless Pro (Best Quality)",
-            "Ultra-Fast Native (Instant 1000 FPS)",
+            "Seamless Pro (Best Quality Neural AI)",
+            "Ultra-Fast Native (1000 FPS Delogo)",
             "Smart Texture Clone (Nearby Patch)",
             "Smart Frosted Blur (Instant)",
             "OpenCV Classical (Fast Fallback)"
@@ -383,16 +573,35 @@ class ControlSidebar(ctk.CTkFrame):
         tog_frame = ctk.CTkFrame(sec, fg_color="transparent")
         tog_frame.pack(fill=tk.X, padx=6, pady=1)
 
+        self.precise_mask_var = ctk.BooleanVar(value=True)
         self.color_match_var = ctk.BooleanVar(value=True)
         self.grain_var = ctk.BooleanVar(value=True)
 
+        ctk.CTkSwitch(tog_frame, text="Precise Mask", variable=self.precise_mask_var,
+                      progress_color=ACCENT_PRIMARY, font=ctk.CTkFont(size=10, weight="bold")).pack(side=tk.LEFT, expand=True)
         ctk.CTkSwitch(tog_frame, text="LAB Color", variable=self.color_match_var,
                       progress_color=ACCENT_PRIMARY, font=ctk.CTkFont(size=10)).pack(side=tk.LEFT, expand=True)
-        ctk.CTkSwitch(tog_frame, text="Film Grain", variable=self.grain_var,
+        ctk.CTkSwitch(tog_frame, text="Grain", variable=self.grain_var,
                       progress_color=ACCENT_PRIMARY, font=ctk.CTkFont(size=10)).pack(side=tk.RIGHT, expand=True)
 
+        feather_row = ctk.CTkFrame(sec, fg_color="transparent")
+        feather_row.pack(fill=tk.X, padx=6, pady=(2, 1))
+        ctk.CTkLabel(feather_row, text="Feather / Blur Radius:", font=ctk.CTkFont(size=10),
+                     text_color=TEXT_PRIMARY).pack(side=tk.LEFT)
+        self.feather_val_label = ctk.CTkLabel(feather_row, text="3px (Tight)",
+                                             font=ctk.CTkFont(size=10, weight="bold"),
+                                             text_color=ACCENT_PRIMARY)
+        self.feather_val_label.pack(side=tk.RIGHT)
+
+        self.feather_slider = ctk.CTkSlider(
+            sec, from_=1, to=15, number_of_steps=14, height=12,
+            progress_color=ACCENT_PRIMARY, button_color="#111111", command=self._on_feather_change
+        )
+        self.feather_slider.set(3)
+        self.feather_slider.pack(fill=tk.X, padx=6, pady=(1, 3))
+
         crf_row = ctk.CTkFrame(sec, fg_color="transparent")
-        crf_row.pack(fill=tk.X, padx=6, pady=(3, 1))
+        crf_row.pack(fill=tk.X, padx=6, pady=(2, 1))
         ctk.CTkLabel(crf_row, text="Quality (CRF):", font=ctk.CTkFont(size=10),
                      text_color=TEXT_PRIMARY).pack(side=tk.LEFT)
         self.crf_val_label = ctk.CTkLabel(crf_row, text="16 (Pristine 4K)",
@@ -422,13 +631,21 @@ class ControlSidebar(ctk.CTkFrame):
         sub_row = ctk.CTkFrame(sec, fg_color="transparent")
         sub_row.pack(fill=tk.X, padx=6, pady=2)
 
+        self.wiper_btn = ctk.CTkButton(
+            sub_row, text="⇄ Split Wiper", font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, border_width=1, border_color=BORDER_STRONG,
+            hover_color=BG_SURFACE_STRONG, corner_radius=4,
+            command=self._toggle_wiper, height=26
+        )
+        self.wiper_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+
         self.preview_btn = ctk.CTkButton(
-            sub_row, text="Preview Inpaint", font=ctk.CTkFont(size=10),
+            sub_row, text="Modal Preview", font=ctk.CTkFont(size=10),
             fg_color=BG_CANVAS, text_color=TEXT_PRIMARY, border_width=1, border_color=BORDER_STRONG,
             hover_color=BG_SURFACE_STRONG, corner_radius=4,
             command=self._preview, height=26
         )
-        self.preview_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+        self.preview_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 2))
 
         self.cancel_btn = ctk.CTkButton(
             sub_row, text="Cancel", font=ctk.CTkFont(size=10, weight="bold"),
@@ -438,18 +655,64 @@ class ControlSidebar(ctk.CTkFrame):
         )
         self.cancel_btn.pack(side=tk.LEFT, padx=(2, 0))
 
+    def _on_feather_change(self, val):
+        f = int(val)
+        desc = f"{f}px (Surgical)" if f <= 2 else f"{f}px (Tight)" if f <= 5 else f"{f}px (Soft)"
+        self.feather_val_label.configure(text=desc)
+
     def _on_crf_change(self, val):
         crf = int(val)
-        desc = "0 (Lossless)" if crf == 0 else f"{crf} (Pristine 4K)" if crf <= 16 else f"{crf} (High Quality)"
+        desc = "0 (Lossless)" if crf == 0 else f"{crf} (Pristine Master)" if crf <= 14 else f"{crf} (High Quality 4K)" if crf <= 18 else f"{crf} (Standard Web)" if crf <= 23 else f"{crf} (High Compression)"
         self.crf_val_label.configure(text=desc)
 
     def update_region_display(self):
+        all_r = self.app.get_all_regions()
+        count = len(all_r)
+        if hasattr(self, "region_count_lbl"):
+            txt = f"{count} Regions Active" if count > 1 else f"{count} Region Selected" if count == 1 else "No Region Selected"
+            self.region_count_lbl.configure(text=txt)
+
         if self.app.region:
             x, y, w, h = self.app.region
             self.coord_vars["x"].set(str(x))
             self.coord_vars["y"].set(str(y))
             self.coord_vars["w"].set(str(w))
             self.coord_vars["h"].set(str(h))
+
+    def _toggle_wiper(self):
+        self.app.canvas_workspace.toggle_split_wiper()
+        is_active = self.app.canvas_workspace.split_wiper_active
+        self.wiper_btn.configure(
+            fg_color=ACCENT_PRIMARY if is_active else BG_CANVAS,
+            text_color="#FFFFFF" if is_active else TEXT_PRIMARY
+        )
+
+    def _add_current_box_to_multi(self):
+        try:
+            x = int(self.coord_vars["x"].get())
+            y = int(self.coord_vars["y"].get())
+            w = int(self.coord_vars["w"].get())
+            h = int(self.coord_vars["h"].get())
+            if w < 5 or h < 5:
+                raise ValueError
+        except Exception:
+            messagebox.showwarning("Invalid Region", "Draw or enter valid X, Y, W, H values first.")
+            return
+
+        roi = (x, y, w, h)
+        if roi not in self.app.regions:
+            self.app.regions.append(roi)
+        self.app.region = roi
+        self.app.canvas_workspace.redraw_all_regions()
+        self.update_region_display()
+
+    def _clear_region(self):
+        self.app.region = None
+        self.app.regions = []
+        for v in self.coord_vars.values():
+            v.set("0")
+        self.app.canvas_workspace.clear_region()
+        self.update_region_display()
 
     def _open_file(self):
         if self.app.active_view_name == "video":
@@ -926,12 +1189,13 @@ class PerformanceDiagnosticsView(ctk.CTkFrame):
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
 
-        hw = vlr.get_hardware_info()
+        hw = vlr.get_hardware_info(quick=True)
+        gpu_sub = f"{hw.get('vram_gb', 0.0)} GB VRAM • PyTorch CUDA Active" if hw["has_cuda"] else "CPU Multi-Threading Active"
 
-        self._build_metric_box(grid, 0, 0, "GPU HARDWARE", hw['gpu_name'], "NVIDIA CUDA Tensor Cores Active")
-        self._build_metric_box(grid, 0, 1, "INPAINTING PIPELINE", "Seamless Pro + Native C++", "1000 FPS Capable Ultra Fast Engine")
-        self._build_metric_box(grid, 1, 0, "COLOR MODEL", "Reinhard CIE-L*a*b*", "Zero Color Fringe or Inpainting Shifts")
-        self._build_metric_box(grid, 1, 1, "FFMPEG INTEGRATION", "H.264 / H.265 / ProRes", "Lossless Audio Streams Preserved")
+        self._build_metric_box(grid, 0, 0, "GPU ACCELERATION", hw['gpu_name'], gpu_sub)
+        self._build_metric_box(grid, 0, 1, "NEURAL INPAINTING", "LaMa PyTorch Tensor Cores", "Sub-15ms Latency / Batch Inference")
+        self._build_metric_box(grid, 1, 0, "PRECISION COLOR PIPELINE", "Reinhard CIE-L*a*b*", "Zero Color Bleed & Adaptive Micro-Grain")
+        self._build_metric_box(grid, 1, 1, "STREAM PIPELINE", "Direct Raw Video Pipe", "Bit-Exact Audio & Subtitle Passthrough")
 
     def _build_metric_box(self, parent, row, col, label, val, sub):
         box = ctk.CTkFrame(parent, corner_radius=6, fg_color=BG_SURFACE,
@@ -1078,7 +1342,7 @@ class CreditsView(ctk.CTkFrame):
                                    border_width=1, border_color=BORDER_DEFAULT)
         details_box.pack(fill=tk.BOTH, expand=True, padx=20, pady=4)
 
-        hw = vlr.get_hardware_info()
+        hw = vlr.get_hardware_info(quick=True)
         info_str = (
             f"Developer       : Doctor9Trio\n"
             f"Profile URL     : https://github.com/Doctor9Trio\n"
@@ -1120,7 +1384,12 @@ class WatermarkStudioApp(ctk.CTk):
         super().__init__()
 
         self.title("Watermark Studio — Professional Media Inpainting")
-        self.geometry("1240x780")
+        win_w, win_h = 1240, 780
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        pos_x = max(0, (screen_w - win_w) // 2)
+        pos_y = max(0, (screen_h - win_h) // 2)
+        self.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
         self.minsize(1000, 650)
 
         # State
@@ -1132,14 +1401,51 @@ class WatermarkStudioApp(ctk.CTk):
         self.video_cap = None
         self.video_info = None
         self.region = None
+        self.regions = []
         self.processing = False
         self.cancel_event = threading.Event()
         self.progress_queue = queue.Queue()
 
+        # Lazy Loaded Views
+        self.hub_view = None
+        self.credits_view = None
+        self.diag_view = None
+        self.batch_view = None
+        self.workstation_frame = None
+
         self._build_top_bar()
         self._build_views_container()
+        self.after(200, self._async_init_hardware)
 
+        # Ensure window is lifted and focused in front of terminal/IDE
+        self.after(50, self._bring_to_front)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _bring_to_front(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.attributes("-topmost", True)
+            self.after(150, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
+    def _async_init_hardware(self):
+        def _worker():
+            try:
+                hw = vlr.get_hardware_info(quick=False)
+                dot_col = "#17824B" if hw["has_cuda"] else "#A96500"
+                txt = "GPU Ready" if hw["has_cuda"] else "CPU Ready"
+                self.after(0, lambda: self._update_gpu_indicator(dot_col, txt))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_gpu_indicator(self, color, text):
+        if hasattr(self, "gpu_dot_lbl") and hasattr(self, "gpu_txt_lbl"):
+            self.gpu_dot_lbl.configure(text_color=color)
+            self.gpu_txt_lbl.configure(text=text)
 
     def _build_top_bar(self):
         top_bar = ctk.CTkFrame(self, height=54, corner_radius=0,
@@ -1194,13 +1500,15 @@ class WatermarkStudioApp(ctk.CTk):
         right_tools.pack(side=tk.RIGHT, padx=20)
 
         # Status Dot
-        hw = vlr.get_hardware_info()
+        hw = vlr.get_hardware_info(quick=True)
         dot_col = "#17824B" if hw["has_cuda"] else "#A96500"
         status_box = ctk.CTkFrame(right_tools, fg_color="transparent")
         status_box.pack(side=tk.LEFT, padx=8)
-        ctk.CTkLabel(status_box, text="●", font=ctk.CTkFont(size=10), text_color=dot_col).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkLabel(status_box, text="GPU Ready", font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color=TEXT_PRIMARY).pack(side=tk.LEFT)
+        self.gpu_dot_lbl = ctk.CTkLabel(status_box, text="●", font=ctk.CTkFont(size=10), text_color=dot_col)
+        self.gpu_dot_lbl.pack(side=tk.LEFT, padx=(0, 4))
+        self.gpu_txt_lbl = ctk.CTkLabel(status_box, text="GPU Ready", font=ctk.CTkFont(size=10, weight="bold"),
+                                       text_color=TEXT_PRIMARY)
+        self.gpu_txt_lbl.pack(side=tk.LEFT)
 
         # Theme Toggle
         theme_icon = icons.get_icon("theme", size=15)
@@ -1226,10 +1534,9 @@ class WatermarkStudioApp(ctk.CTk):
         self.views_container.pack(fill=tk.BOTH, expand=True)
 
         self.hub_view = MainHubView(self.views_container, self)
-        self.credits_view = CreditsView(self.views_container, self)
-        self.diag_view = PerformanceDiagnosticsView(self.views_container, self)
-        self.batch_view = BatchQueueView(self.views_container, self)
+        self.switch_view("hub")
 
+    def _build_workstation_frame(self):
         # Workstation Editor Frame (Video & Image Studios)
         self.workstation_frame = ctk.CTkFrame(self.views_container, fg_color="transparent")
 
@@ -1301,33 +1608,50 @@ class WatermarkStudioApp(ctk.CTk):
         )
         self.status_text.pack(side=tk.RIGHT, padx=12)
 
-        self.switch_view("hub")
-
     def switch_view(self, view_name):
         self.active_view_name = view_name
-        self.hub_view.pack_forget()
-        self.credits_view.pack_forget()
-        self.diag_view.pack_forget()
-        self.batch_view.pack_forget()
-        self.workstation_frame.pack_forget()
+        if self.hub_view:
+            self.hub_view.pack_forget()
+        if self.credits_view:
+            self.credits_view.pack_forget()
+        if self.diag_view:
+            self.diag_view.pack_forget()
+        if self.batch_view:
+            self.batch_view.pack_forget()
+        if self.workstation_frame:
+            self.workstation_frame.pack_forget()
 
         for v_id, btn in self.nav_btns.items():
             btn.configure(text_color=ACCENT_PRIMARY if v_id == view_name else TEXT_SECONDARY)
 
         if view_name == "hub":
+            if self.hub_view is None:
+                self.hub_view = MainHubView(self.views_container, self)
             self.hub_view.pack(fill=tk.BOTH, expand=True)
             self.hub_view.pipeline_canvas.start()
         elif view_name == "diagnostics":
-            self.hub_view.pipeline_canvas.stop()
+            if self.hub_view:
+                self.hub_view.pipeline_canvas.stop()
+            if self.diag_view is None:
+                self.diag_view = PerformanceDiagnosticsView(self.views_container, self)
             self.diag_view.pack(fill=tk.BOTH, expand=True)
         elif view_name == "batch":
-            self.hub_view.pipeline_canvas.stop()
+            if self.hub_view:
+                self.hub_view.pipeline_canvas.stop()
+            if self.batch_view is None:
+                self.batch_view = BatchQueueView(self.views_container, self)
             self.batch_view.pack(fill=tk.BOTH, expand=True)
         elif view_name == "credits":
-            self.hub_view.pipeline_canvas.stop()
+            if self.hub_view:
+                self.hub_view.pipeline_canvas.stop()
+            if self.credits_view is None:
+                self.credits_view = CreditsView(self.views_container, self)
             self.credits_view.pack(fill=tk.BOTH, expand=True)
         else:
-            self.hub_view.pipeline_canvas.stop()
+            if self.hub_view:
+                self.hub_view.pipeline_canvas.stop()
+            if self.workstation_frame is None:
+                self._build_workstation_frame()
             self.workstation_frame.pack(fill=tk.BOTH, expand=True)
 
             if view_name == "image":
@@ -1411,21 +1735,31 @@ class WatermarkStudioApp(ctk.CTk):
         if not self.video_cap or not self.video_info:
             return
         frame_idx = int(val)
-        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        dur = frame_idx / max(self.video_info["fps"], 1.0)
+        total_f = self.video_info["total_frames"] or 100
+        self.time_label.configure(text=f"{vlr.format_time(dur)} ({frame_idx}/{total_f})")
+
+        self._pending_seek_frame = frame_idx
+        if hasattr(self, "_seek_job") and self._seek_job:
+            self.after_cancel(self._seek_job)
+        self._seek_job = self.after(16, self._perform_seek)
+
+    def _perform_seek(self):
+        self._seek_job = None
+        if not self.video_cap or not hasattr(self, "_pending_seek_frame"):
+            return
+        self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, self._pending_seek_frame)
         ret, frame = self.video_cap.read()
         if ret:
             self.current_frame = frame
             self.canvas_workspace.show_frame(frame)
-            dur = frame_idx / max(self.video_info["fps"], 1.0)
-            total_f = self.video_info["total_frames"] or 100
-            self.time_label.configure(text=f"{vlr.format_time(dur)} ({frame_idx}/{total_f})")
 
     def _apply_settings(self):
         engine_str = self.sidebar.engine_var.get()
         if "Seamless Pro" in engine_str:
             vlr.INPAINT_ENGINE = "seamless_pro"
-        elif "Ultra-Fast" in engine_str:
-            vlr.INPAINT_ENGINE = "fast"
+        elif "Ultra-Fast" in engine_str or "Delogo" in engine_str or "Native" in engine_str:
+            vlr.INPAINT_ENGINE = "fast_v1"
         elif "Clone" in engine_str:
             vlr.INPAINT_ENGINE = "clone"
         elif "Blur" in engine_str:
@@ -1436,7 +1770,19 @@ class WatermarkStudioApp(ctk.CTk):
         vlr.TRACKING_MODE = self.sidebar.tracking_var.get()
         vlr.COLOR_MATCH = self.sidebar.color_match_var.get()
         vlr.ADD_GRAIN = self.sidebar.grain_var.get()
+        vlr.PRECISE_MASK = self.sidebar.precise_mask_var.get()
+        feather_val = int(self.sidebar.feather_slider.get())
+        vlr.FEATHER_RADIUS = feather_val
+        vlr.BLUR_RADIUS = max(3, feather_val * 2 + 1)
         vlr.CRF_QUALITY = int(self.sidebar.crf_slider.get())
+
+    def get_all_regions(self):
+        """Retrieve all active watermark bounding boxes."""
+        if hasattr(self, "regions") and self.regions:
+            return list(self.regions)
+        elif hasattr(self, "region") and self.region:
+            return [self.region]
+        return []
 
     def start_processing(self):
         self._apply_settings()
@@ -1579,8 +1925,16 @@ class WatermarkStudioApp(ctk.CTk):
 #  ENTRY POINT
 # ──────────────────────────────────────────────
 def main():
+    print("=================================================================")
+    print("  WATERMARK STUDIO PRO — MEDIA INPAINTING WORKSTATION           ")
+    print("=================================================================")
+    print(" [INFO] Initializing UI components...")
     app = WatermarkStudioApp()
-    app.mainloop()
+    print(" [READY] Application window is open on your desktop.")
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        print("\n [EXIT] Application closed by user.")
 
 
 if __name__ == "__main__":
