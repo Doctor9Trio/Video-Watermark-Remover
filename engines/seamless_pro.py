@@ -49,9 +49,7 @@ def lama_inpaint_batch(roi_bgr_list, roi_mask_binary, enable_color_match=False, 
     neural_indices = []
 
     for idx, img in enumerate(roi_bgr_list):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        valid_ring = outer_ring & (gray > 20)
-        ring_pixels = img[valid_ring > 0] if np.any(valid_ring > 0) else img[outer_ring > 0]
+        ring_pixels = img[outer_ring > 0]
 
         if len(ring_pixels) >= 10:
             ring_std = float(np.max(np.std(ring_pixels, axis=0)))
